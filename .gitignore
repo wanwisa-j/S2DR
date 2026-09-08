@@ -1,0 +1,9 @@
+# scratch / outputs / archives — not source
+_archive_*/
+bench-10patch/
+output/
+staging/
+vrtcache/
+**/__pycache__/
+*.pyc
+.*.done
