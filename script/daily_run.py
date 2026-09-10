@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import random
@@ -42,6 +43,12 @@ from core_runner import (
 import s1_check
 from stac_check import _PRODUCTS_URL, _get_cdse_token
 from tile_grouping import load_or_build_cell_tile_map
+
+# Retry / circuit-breaker notices go here rather than through progress_cb: they
+# must not depend on a consumer (the Dagster asset) knowing a new event "phase".
+# Dagster's run launcher captures the subprocess's root logger into the run's
+# compute logs; a standalone caller sees it on stderr.
+log = logging.getLogger("s2sr.daily_run")
 
 HOST_ID = "87"
 PATCH_KM = 8.0
@@ -238,6 +245,10 @@ def run_daily(
                         reprobe with no per-cell log to show it).
       (no "phase" key) -- per-cell: aoi_name, skipped, returncode,
                         wall_time_s, n_done, n_total.
+    Per-cell retry and the IO circuit breaker deliberately do NOT emit a
+    progress_cb event (a consumer that doesn't know the phase would break) --
+    they go to logging.getLogger("s2sr.daily_run") as [RETRY] / [CIRCUIT-OPEN],
+    which Dagster captures into the run's compute logs.
     These fire early -- select_covered_cells + s1_check.check
     are both live API calls (CDSE, ASF) that can take a while with nothing
     else to show for it otherwise. Callers can print() (standalone testing)
@@ -350,10 +361,12 @@ def run_daily(
                     error = f"{type(exc).__name__}: {exc}"
                     if attempt < CELL_RETRY_ATTEMPTS and _is_transient(error):
                         slept = _sleep_with_backoff(attempt)
-                        if progress_cb:
-                            progress_cb({"phase": "cell_retry", "aoi_name": aoi_name,
-                                         "worker_id": worker_id, "attempt": attempt,
-                                         "backoff_s": round(slept, 1), "error": error[:120]})
+                        log.warning(
+                            "[RETRY] worker=%d %s attempt %d/%d failed (transient), "
+                            "backing off %.1fs then re-dispatching: %s",
+                            worker_id, aoi_name, attempt, CELL_RETRY_ATTEMPTS,
+                            slept, error[:160],
+                        )
                         continue
                     break
             t1 = time.time()
@@ -377,14 +390,19 @@ def run_daily(
                     io_fail_streak += 1
                     if io_fail_streak >= IO_CIRCUIT_BREAK_CONSECUTIVE and not io_circuit_open:
                         io_circuit_open = True
+                        drained = 0
                         while not work_q.empty():
                             try:
                                 work_q.get_nowait()
+                                drained += 1
                             except queue.Empty:
                                 break
-                        if progress_cb:
-                            progress_cb({"phase": "io_circuit_open",
-                                         "consecutive_failures": io_fail_streak})
+                        log.error(
+                            "[CIRCUIT-OPEN] %d consecutive transient IO failures -- "
+                            "shared FS/S3 likely degrading; dropped %d undispatched "
+                            "cell(s), letting in-flight cells finish then stopping",
+                            io_fail_streak, drained,
+                        )
 
             cloud_mask_result, cloud_mask_error = None, None
             if output_path:
