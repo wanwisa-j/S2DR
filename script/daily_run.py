@@ -417,6 +417,15 @@ def run_daily(
     next_worker_id = 0
     while not work_q.empty() or any(t.is_alive() for t in active_threads):
         active_threads = [t for t in active_threads if t.is_alive()]
+
+        if work_q.empty():
+            # Nothing left to dispatch (workers only get_nowait, never put) --
+            # just wait out the running cells. No more reprobing, and no
+            # trailing sleep once they finish.
+            for t in active_threads:
+                t.join()
+            break
+
         cap = probe_host(host_id, patch_km=patch_km)
         while len(active_threads) < cap.max_concurrency and not work_q.empty():
             t = threading.Thread(target=worker, args=(next_worker_id,), daemon=True)
