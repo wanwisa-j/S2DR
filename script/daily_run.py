@@ -44,9 +44,9 @@ from stac_check import _PRODUCTS_URL, _get_cdse_token
 from tile_grouping import load_or_build_cell_tile_map
 
 HOST_ID = "87"
-PATCH_KM = 6.0
+PATCH_KM = 8.0
 REPROBE_INTERVAL_S = 30
-GRID_PATH = "/fs2/wanwisa/s2sr-corridor/grid-435-6km/corridor_grid.parquet"
+GRID_PATH = "/fs2/wanwisa/s2sr-corridor/grid-7km5/corridor_grid.parquet"
 
 # Cloud pre-filter: skip a cell BEFORE dispatch when this fraction or more of
 # its TRUE corridor shape (not the 6km bbox) is cloud ({1,2} in OMNI_SCL) --
