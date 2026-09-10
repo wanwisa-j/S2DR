@@ -1,0 +1,8 @@
+{
+"type": "FeatureCollection",
+"name": "PTTCORRIDOR-00239",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "aoi_name": "PTTCORRIDOR-00239" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 101.206264052756978, 13.809999409805378 ], [ 101.206258632013601, 13.809423347232128 ], [ 101.206185821729562, 13.809756354757267 ], [ 101.206131930331125, 13.810000597177496 ], [ 101.206264052756978, 13.809999409805378 ] ] ] } }
+]
+}

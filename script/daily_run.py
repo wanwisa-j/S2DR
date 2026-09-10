@@ -49,7 +49,7 @@ REPROBE_INTERVAL_S = 30
 GRID_PATH = "/fs2/wanwisa/s2sr-corridor/grid-7km5/corridor_grid.parquet"
 
 # Cloud pre-filter: skip a cell BEFORE dispatch when this fraction or more of
-# its TRUE corridor shape (not the 6km bbox) is cloud ({1,2} in OMNI_SCL) --
+# its TRUE corridor shape (not the full cell bbox) is cloud ({1,2} in OMNI_SCL) --
 # such a cell delivers a raster mask_cloud_nodata nulls out almost entirely, so
 # the ~250s GPU run is wasted. Deliberately high: a cell with any usable clear
 # corridor still runs. MIN_PX guards the estimate on the ~7px-wide strip.
@@ -102,16 +102,16 @@ def _cell_geom(aoi_file: str):
 
 
 def select_covered_cells(date_str: str, token: str | None = None):
-    """Every 6km corridor cell with real, confirmed S2 coverage on date_str,
+    """Every corridor cell with real, confirmed S2 coverage on date_str,
     each with its best-covering tile_id + cloud_cover attached (tile_id is
     required for cloud_mask). Same method as the validated
     select_corridor_cells.py.
 
     Returns (records, cells_gdf): records is a list[dict] of every covered
     cell (cell_id, aoi_name, aoi_file, tile_id, cloud_cover); cells_gdf is
-    the FULL 435-cell grid (WGS84, unfiltered) -- s1_check needs the full
-    grid, not just the covered subset, to compute priority cell membership
-    correctly."""
+    the FULL grid (WGS84, unfiltered, 321 cells on the 7.5km grid) --
+    s1_check needs the full grid, not just the covered subset, to compute
+    priority cell membership correctly."""
     import geopandas as gpd
     import pandas as pd
     import requests
