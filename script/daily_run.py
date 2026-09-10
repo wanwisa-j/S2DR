@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import queue
+import random
 import subprocess
 import threading
 import time
@@ -54,6 +55,37 @@ GRID_PATH = "/fs2/wanwisa/s2sr-corridor/grid-435-6km/corridor_grid.parquet"
 # corridor still runs. MIN_PX guards the estimate on the ~7px-wide strip.
 CLOUD_SKIP_FRACTION = 0.95
 CLOUD_SKIP_MIN_PX = 200
+
+# Per-cell retry: the container skips a patch on transient source/read faults
+# (corrupt COG chunk, RasterioIOError, HTTP hiccup) and then fails the whole
+# cell with "no patches produced". Re-running the docker-run is a CLEAN retry --
+# fresh /content/datapath, fresh download -- so a corrupt-chunk failure like
+# `IMCD_LZW_CORRUPT` (seen on cell 00083, 2026-09-09) usually succeeds the
+# second time. A non-transient failure (bad AOI, real OOM) is not retried.
+CELL_RETRY_ATTEMPTS = 2
+_TRANSIENT_MARKERS = (
+    "IMCD_LZW", "imcd_lzw", "CORRUPT", "RasterioIOError", "Error opening",
+    "HTTP response code", "timed out", "Connection", "CURL", "CPLE_",
+)
+# Circuit breaker (fastsar "fail closed, not guess-and-continue"): if this many
+# cells in a row fail with a transient/IO fault, the shared filesystem or S3 is
+# probably in trouble -- stop dispatching rather than grind through the rest of
+# the corridor hammering a sick NAS (the 2026-09-02 /fs2 incident).
+IO_CIRCUIT_BREAK_CONSECUTIVE = 8
+
+
+def _sleep_with_backoff(attempt: int, base: float = 3.0, cap: float = 60.0) -> float:
+    """Exponential backoff + 0-25% jitter (so concurrent workers don't retry in
+    lockstep against the same S3/NAS). Ported from sentinel-1-fastsar
+    downloader/retry_util.py. Returns the delay slept."""
+    delay = min(cap, base * (2 ** (attempt - 1)))
+    delay += random.uniform(0, delay * 0.25)
+    time.sleep(delay)
+    return delay
+
+
+def _is_transient(msg: str | None) -> bool:
+    return bool(msg) and any(m in msg for m in _TRANSIENT_MARKERS)
 
 
 def _cell_geom(aoi_file: str):
@@ -248,10 +280,14 @@ def run_daily(
     results_lock = threading.Lock()
     n_skipped = 0
     n_skipped_cloud = 0
+    io_fail_streak = 0      # consecutive transient/IO cell failures (circuit breaker)
+    io_circuit_open = False
 
     def worker(worker_id: int):
-        nonlocal n_skipped, n_skipped_cloud
+        nonlocal n_skipped, n_skipped_cloud, io_fail_streak, io_circuit_open
         while True:
+            if io_circuit_open:
+                return
             try:
                 cell = work_q.get_nowait()
             except queue.Empty:
@@ -296,18 +332,30 @@ def run_daily(
                     scl = None
 
             t0 = time.time()
-            error, returncode = None, None
+            error, returncode, n_attempts = None, None, 0
             if progress_cb:
                 progress_cb({"phase": "cell_dispatch_start", "aoi_name": aoi_name,
                              "worker_id": worker_id})
-            try:
-                result = run_s2_super_resolution(
-                    host_id=host_id, aoi_file=cell["aoi_file"], date_str=date_str,
-                    aoi_name=aoi_name, patch_km=patch_km, gpu_available=True, threads=4,
-                )
-                returncode = result.returncode
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
+            for attempt in range(1, CELL_RETRY_ATTEMPTS + 1):
+                n_attempts = attempt
+                try:
+                    result = run_s2_super_resolution(
+                        host_id=host_id, aoi_file=cell["aoi_file"], date_str=date_str,
+                        aoi_name=aoi_name, patch_km=patch_km, gpu_available=True, threads=4,
+                    )
+                    returncode = result.returncode
+                    error = None
+                    break
+                except Exception as exc:  # noqa: BLE001 -- one bad cell must not kill the run
+                    error = f"{type(exc).__name__}: {exc}"
+                    if attempt < CELL_RETRY_ATTEMPTS and _is_transient(error):
+                        slept = _sleep_with_backoff(attempt)
+                        if progress_cb:
+                            progress_cb({"phase": "cell_retry", "aoi_name": aoi_name,
+                                         "worker_id": worker_id, "attempt": attempt,
+                                         "backoff_s": round(slept, 1), "error": error[:120]})
+                        continue
+                    break
             t1 = time.time()
 
             output_path, validation_error = None, None
@@ -316,6 +364,27 @@ def run_daily(
                 output_path = str(p)
             except Exception as exc:
                 validation_error = f"{type(exc).__name__}: {exc}"
+
+            # Circuit breaker (fastsar "fail closed"): a clean success resets the
+            # streak; a transient failure that survived the retry extends it, and
+            # once IO_CIRCUIT_BREAK_CONSECUTIVE cells in a row have failed that
+            # way, stop dispatching the rest -- the shared FS / S3 is likely
+            # degrading and grinding on only makes it worse.
+            with results_lock:
+                if output_path and returncode == 0:
+                    io_fail_streak = 0
+                elif _is_transient(error):
+                    io_fail_streak += 1
+                    if io_fail_streak >= IO_CIRCUIT_BREAK_CONSECUTIVE and not io_circuit_open:
+                        io_circuit_open = True
+                        while not work_q.empty():
+                            try:
+                                work_q.get_nowait()
+                            except queue.Empty:
+                                break
+                        if progress_cb:
+                            progress_cb({"phase": "io_circuit_open",
+                                         "consecutive_failures": io_fail_streak})
 
             cloud_mask_result, cloud_mask_error = None, None
             if output_path:
@@ -333,7 +402,7 @@ def run_daily(
                 results.append({
                     "worker_id": worker_id, "aoi_name": aoi_name, "skipped": False,
                     "wall_time_s": round(t1 - t0, 2), "returncode": returncode,
-                    "run_error": error, "output_path": output_path,
+                    "n_attempts": n_attempts, "run_error": error, "output_path": output_path,
                     "validation_error": validation_error,
                     "cloud_fraction": round(cloud_frac, 3) if cloud_frac is not None else None,
                     "cloud_mask_result": cloud_mask_result, "cloud_mask_error": cloud_mask_error,
