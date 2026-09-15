@@ -33,7 +33,14 @@ IMAGE = "registry.earthinsights.space/earthinsights/ei-geoint-superresolution:0.
 # every dispatch host (checked host 87 directly, same NFS export as /fs2),
 # so nothing else about the shared-mount/de-dup reasoning below changes.
 REMOTE_OUT_BASE = "/fs8/project_data/tso_data/Shared_data/Deep_resolution/Daily"
-REMOTE_STAGE_ROOT = "/fs2/wanwisa/s2sr-corridor/staging"
+# On /fs8, not /fs2: this scratch dir used to live on /fs2 and a 2026-09-12/15
+# NAS outage on 172.16.99.203 (serves /fs2 + /fs7) proved that a hung `mkdir -p`
+# on ANY operand blocks the whole command -- since dispatch does
+# `mkdir -p {out_dir} {stage_dir} && docker run ...` in one shot, a stuck
+# staging dir freezes the cell even though the real output (/fs8, a different
+# NAS, 172.16.99.204) was healthy the entire time. /fs8 confirmed mounted
+# identically on every dispatch host (see REMOTE_OUT_BASE above).
+REMOTE_STAGE_ROOT = "/fs8/wanwisa/s2dr-staging"
 
 # --- on-prem Sentinel-2 source, opt-in (thcom-s2dr4 THCOM_LOCAL_SOURCE) -------
 # The container reads source bands from these NAS roots instead of
