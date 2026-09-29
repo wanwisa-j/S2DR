@@ -40,6 +40,7 @@ from cloud_mask import cloud_fraction_over, find_omni_scl, load_scl, mask_cloud_
 from core_runner import (
     remote_date_dir, run_s2_super_resolution, validate_output, output_already_done,
 )
+from generate_preview import generate_preview
 import s1_check
 from stac_check import _PRODUCTS_URL, _get_cdse_token
 from tile_grouping import load_or_build_cell_tile_map
@@ -216,7 +217,19 @@ def _build_vrt(date_str: str, subdir: str, aoi_names: list[str]) -> str | None:
 
     vrt_name = f"corridor_{date_compact}_{subdir}.vrt"
     subprocess.run(["gdalbuildvrt", vrt_name, *files], cwd=vrt_dir, check=True, capture_output=True)
-    return os.path.join(vrt_dir, vrt_name)
+    vrt_path = os.path.join(vrt_dir, vrt_name)
+
+    # Lightweight whole-corridor preview for the platform (a colleague wants
+    # to eyeball where imagery landed without opening the full-res VRT). Best
+    # effort: a corrupt source tile or any other preview failure must not
+    # cost the real deliverable -- the VRT itself already exists by this
+    # point regardless of what happens below.
+    try:
+        generate_preview(vrt_path, vrt_path.rsplit(".vrt", 1)[0] + ".png")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return vrt_path
 
 
 def run_daily(
