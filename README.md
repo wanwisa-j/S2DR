@@ -1,10 +1,18 @@
 # s2sr-corridor
 
 Daily dispatcher for the Sentinel-2 10x super-resolution (S2DR4) job. This
-repo does **not** contain the super-resolution model itself — it SSHes into
-a GPU host and runs a pre-built vendor docker image (see
-[`script/core_runner.py`](script/core_runner.py)) once per AOI cell per day,
-then mosaics the results.
+repo does **not** contain the super-resolution model itself and does **not**
+build any docker image — it SSHes into a GPU host and runs an
+**already-built** image once per AOI cell per day, then mosaics the results.
+
+**Where the image comes from:** this team's image
+(`registry.earthinsights.space/earthinsights/ei-geoint-superresolution:0.1.0`,
+pinned in `script/core_runner.py`'s `IMAGE` constant) is built from
+[thcom-s2dr4](https://github.com/thcom-anawat/thcom-s2dr4) — a *separate*
+repo that owns the model, the Dockerfile, and the vendor weights, and has no
+shared git history with this one. If you don't already have your own image
+built from `thcom-s2dr4` (or equivalent), **you cannot run this repo** —
+there is nothing here that builds one for you.
 
 Called from Dagster (`dagster/S2DR/assets/s2dr_daily_run_asset.py` in the
 orchestrator repo) via:
@@ -36,11 +44,14 @@ run_daily(date_str, mode)
 - `script/cloud_mask.py`, `script/stac_check.py`, `script/tile_grouping.py`,
   `script/s1_check.py` — scene selection / cloud-cover / SAR cross-check
   inputs to `daily_run.py`.
-- `script/retention.py` — deletes output/staging date-folders older than
-  `retention_days` (default 14). **Not currently scheduled anywhere** — run
-  it by hand (`plan_cleanup()` first, always; `cleanup(dry_run=False)` only
-  after reviewing the plan) if disk needs reclaiming. Nothing deletes old
-  data automatically right now.
+- `script/retention.py` — **exists but nothing calls it.** Right now,
+  production keeps every date-folder forever — confirmed directly: output
+  going back to 2025-03 is all still there, nothing has ever been
+  auto-deleted. `retention.py` is a manual tool you can run by hand
+  (`plan_cleanup()` first, always, to see what it *would* delete;
+  `cleanup(dry_run=False)` only after reviewing that plan) if disk ever
+  needs reclaiming — it is not wired into any schedule or cron, so until
+  someone runs it, storage only grows.
 
 ## ⚠️ Before you run this yourself — config that is hardcoded to THIS deployment
 
@@ -75,21 +86,47 @@ code change. `HOST_ID` in `daily_run.py` just has to match one of your `<N>`s.
 
 ### Building your own grid
 
-`grid-7km5/corridor_grid.parquet` is a plain DataFrame, one row per AOI cell:
+`grid-7km5/corridor_grid.parquet` (production's grid) is a plain DataFrame,
+one row per AOI cell:
 
 ```
 cell_id, bbox_west, bbox_south, bbox_east, bbox_north, patch_km, aoi_name, aoi_file
 ```
 
 `aoi_file` points at a per-cell GeoJSON (WGS84 — reproject before writing;
-the vendor image expects WGS84 regardless of your source CRS) under
-`<grid-dir>/aoi_cells/<aoi_name>.geojson`. There's no grid-builder script in
-this repo (ours was built once, ad hoc) — the pattern is: pick a cell size
-**smaller than your `patch_km`** (we use 7.5km cells with an 8km patch,
-specifically so every cell needs exactly 1 patch — see the "minimum unit
-cost = 1 patch" note below), tile your AOI polygon into cells of that size,
-keep only cells that intersect it, write each as its own GeoJSON, and
-collect the columns above into a parquet. Point `GRID_PATH` at the result.
+the vendor image expects WGS84 regardless of your source CRS).
+
+`script/build_grid.py` builds this from any AOI boundary file geopandas can
+read (Shapefile, GeoPackage, GeoJSON):
+
+```
+python script/build_grid.py your_aoi.shp ./my_grid --prefix MYPROJECT
+```
+
+Tiles your AOI into cells **smaller than `--patch-km`** (default 7.5km
+cells / 8km patch — the same margin production uses, so every cell needs
+exactly 1 patch; see the "minimum unit cost = 1 patch" note below), keeps
+only cells that actually intersect the AOI polygon, and writes
+`./my_grid/grid.parquet` + `./my_grid/aoi_cells/MYPROJECT-NNNN.geojson`.
+This is separate from (and doesn't touch) `grid-7km5/`, production's own
+grid.
+
+### Running your own grid
+
+`script/run_adhoc.py` dispatches a grid built above — resumable, retries a
+transient failure once, concurrency-aware (via `capacity_probe`) — without
+touching `daily_run.py` or its production wiring at all:
+
+```
+python script/run_adhoc.py ./my_grid/grid.parquet \
+  --dates 2026-01-10 2026-01-25 \
+  --host-id <N> --image <your image> \
+  --out-base /your/own/output/path --stage-base /your/own/staging/path
+```
+
+`--host-id`, `--image`, `--out-base` and `--stage-base` are all required —
+deliberately no defaults, so this can never silently fall back to this
+team's registry image, production output path, or GPU host.
 
 ## Quickstart — test before you schedule anything
 
@@ -127,16 +164,20 @@ scaling a big-patch cost down to a smaller nominal area.
    scene if not — decide up front whether that's acceptable for your use
    case, since `--no-exact-date` does **not** make the mosaic step use the
    substituted date).
-4. Only after a clean single-cell result, call `run_daily(date_str, mode,
-   host_id="<N>")` for a full day.
+4. Only after a clean single-cell result, move to `script/run_adhoc.py`
+   (above) for a full batch — or `run_daily(date_str, mode, host_id="<N>")`
+   if you're wiring this into your own Dagster deployment.
 
 ## Storage note
+
+**Nothing is ever deleted automatically.** Every date-folder this has ever
+produced is still there — see `retention.py` above if you need to reclaim
+space; until you run it by hand, storage only grows.
 
 Each cell's output dir holds the final mosaic TIF/metadata/footprint *plus*
 a `TH/` subfolder of raw per-patch rasters from before mosaicking — roughly
 the same size as the final TIF, sometimes larger. `TH/` isn't pure scratch:
 `metadata.json`'s `sources[].file` references it, and a re-run of the same
 cell+date skips already-done patches by checking for their file there
-(`patches_already_done` in the metadata). Nothing currently prunes it
-automatically except the unscheduled `retention.py` (14-day window, deletes
-the whole date-folder, `TH/` included).
+(`patches_already_done` in the metadata) — so deleting it trades disk space
+for losing that resume capability, if you ever decide to clean it up.
