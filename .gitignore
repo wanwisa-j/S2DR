@@ -7,3 +7,7 @@ vrtcache/
 **/__pycache__/
 *.pyc
 .*.done
+
+# old 6km/435-cell grid, superseded by grid-7km5 (daily_run.py's GRID_PATH) —
+# kept on disk for reference, no longer tracked in git
+grid-435-6km/
